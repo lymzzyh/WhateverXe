@@ -82,6 +82,7 @@
 #include "kern_tgl_submit_history.hpp"
 #include "kern_tgl_hang_select.hpp"
 #include "kern_tgl_recovery.hpp"
+#include "kern_tgl_concurrency.hpp"
 #include "kern_tgl_aux_call.hpp"
 
 #include <Headers/kern_api.hpp>
@@ -101,6 +102,30 @@
 #include <libkern/c++/OSData.h>
 
 extern "C" const char version[];
+static bool tglConcurrencyEnabled;
+static TGLConcurrency::Trace<> tglConcurrency;
+static uint64_t tglConcurrencyNow() {
+ uint64_t t,ns;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);return ns;
+}
+struct TGLConcurrencyScope {
+ TGLConcurrency::Token token {};uint64_t result {};
+ TGLConcurrencyScope(TGLConcurrency::Kind kind,void *object,uint64_t engine=UINT64_MAX,uint64_t a=0,uint64_t b=0) {
+  if(__atomic_load_n(&tglConcurrencyEnabled,__ATOMIC_ACQUIRE))
+   token=tglConcurrency.enter(tglConcurrencyNow(),reinterpret_cast<uintptr_t>(current_thread()),kind,
+    reinterpret_cast<uintptr_t>(object),engine,a,b,cpu_number(),ml_get_interrupts_enabled());
+ }
+ ~TGLConcurrencyScope() {
+  if(token.span)tglConcurrency.leave(token,tglConcurrencyNow(),result,cpu_number(),ml_get_interrupts_enabled());
+ }
+};
+static bool tglConcurrencySerialize(void *,void *,OSSerialize *serializer) {
+ using Snapshot=TGLConcurrency::Trace<>::Snapshot;
+ auto snapshot=static_cast<Snapshot *>(IOMalloc(sizeof(Snapshot)));if(!snapshot)return false;
+ bzero(snapshot,sizeof(*snapshot));tglConcurrency.snapshot(*snapshot);
+ auto data=OSData::withBytes(snapshot,sizeof(*snapshot));IOFree(snapshot,sizeof(*snapshot));
+ if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
 extern "C" __attribute__((naked,used)) void tglHangPreStopBridge() {
  // Exact haltCommandStreamer keeps engine in r14d, scheduler in r15.
@@ -314,9 +339,11 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 }
 
 void XE::wrapTGLRecovery(void *channel) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::Recovery,channel);
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
 	const auto result=TGLRecovery::resetAndResume(channel);
+ concurrent.result=result.resetOK;
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
@@ -11987,6 +12014,20 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				const auto qualified=OSDynamicCast(OSBoolean,IORegistryEntry::getRegistryRoot()->getProperty("WEXLocalTahoeABIHookReady"));
 				tglAcceleratorReady=tglAcceleratorReady && qualified && qualified->isTrue();
 			}
+            // CPU-only diagnostics use existing qualified routes. They never
+            // serialize native work, change recovery policy or read GPU registers.
+            const bool smpRequested=ADLSRCSFlush::requested(xeProfile,XELP::kernelOS(version),
+             checkKernelArgument("-disablegfxfirmware"),localABI && localABI->isTrue(),
+             checkKernelArgument("-wex-adls-smp-trace"));
+            bool smpReady=smpRequested && tglAcceleratorReady && tglHangPreStopReady;
+            if(smpReady) {
+             auto live=OSSerializer::forTarget(nullptr,tglConcurrencySerialize);
+             smpReady=live && IORegistryEntry::getRegistryRoot()->setProperty("TGLSMPTraceLive",live);
+             if(live)live->release();
+            }
+            __atomic_store_n(&tglConcurrencyEnabled,smpReady,__ATOMIC_RELEASE);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLSMPTraceRequested",smpRequested);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLSMPTraceReady",smpReady);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLResourceDiagnosticsRemoved",true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorAdmissionReady", tglAcceleratorReady);
 			patcher.clearError();
@@ -14759,6 +14800,7 @@ void xelpRegularForceWakeProtected(void *owner,bool enable,unsigned domains) {
  uint64_t flags=0;
  if(owner)memcpy(&flags,static_cast<uint8_t *>(owner)+0x1190,sizeof(flags));
  if(!owner || !XELPForceWakeIRQ::required(flags,domains)) {
+  TGLConcurrencyScope concurrent(TGLConcurrency::ForceWake,owner,UINT64_MAX,enable,domains);
   __atomic_fetch_add(&xelpForceWakeIRQ[6],1ULL,__ATOMIC_RELAXED);
   reinterpret_cast<TGLCSBForceWake>(xelpRegularForceWakeOriginal)(owner,enable,domains);
   return;
@@ -14766,6 +14808,7 @@ void xelpRegularForceWakeProtected(void *owner,bool enable,unsigned domains) {
  // Protect every regular caller, including telemetry interrupted by IRQ submit.
  // Preserve native counted client1 and restore the caller's prior interrupt state.
  const auto prior=XELPForceWakeIRQ::protect([](boolean_t enabled) {return ml_set_interrupts_enabled(enabled);},[&] {
+  TGLConcurrencyScope concurrent(TGLConcurrency::ForceWake,owner,UINT64_MAX,enable,domains);
   uint64_t start,end,ns;clock_get_uptime(&start);
   __atomic_fetch_add(&xelpForceWakeIRQ[0],1ULL,__ATOMIC_RELAXED);
   reinterpret_cast<TGLCSBForceWake>(xelpRegularForceWakeOriginal)(owner,enable,domains);
@@ -14977,10 +15020,12 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
 void XE::wrapTGLCSBReset(void *streamer) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::Reset,streamer);
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::CSB,streamer,UINT64_MAX,flags);
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
@@ -15363,6 +15408,12 @@ static void tglRPCSPowerObserve(void *owner,uint64_t context,uint64_t ordinal,un
 }
 
 extern "C" void tglHangPreStopWake(void *owner,bool enable,unsigned domains,unsigned engine,void *scheduler) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::ForceWake,owner,engine,enable,domains);
+ // Freeze CPU breadcrumbs before the native wake: if that wake blocks on a
+ // different CPU, the first active calls remain retrievable by the collector.
+ if(__atomic_load_n(&tglConcurrencyEnabled,__ATOMIC_ACQUIRE) && tglHangPreStopReady &&
+    enable && domains==7 && !engine && owner==tglHost.owner)
+  tglConcurrency.freeze(tglConcurrencyNow());
  // Call the protected, counted native wake exactly once, before observing.
  tglCSBForceWake[0](owner,enable,domains);
  if(!tglHangPreStopReady || !enable || domains!=7 || engine || owner!=tglHost.owner || !tglVM.nofault)return;
@@ -15501,6 +15552,7 @@ void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t
 }
 
 void XE::wrapTGLBlitDeferredInit(void *context,void *params,const void *rects) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::BlitSubmit,context);
  // r310 contrast: preserve the original init commands and separate their
  // submission, but do so on first actual copy, after context construction.
  // The r207 capture qualified exactly A00 pending bytes with BBE at +860.
@@ -15683,6 +15735,7 @@ static bool tglRPCSPowerSerialize(void *,void *,OSSerialize *serializer) {
 }
 
 void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::Submit,streamer,UINT64_MAX,flags);
  if (callbackXE->adlnDetected) {
   auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(streamer)+0x10);
   if (!adlnNativeIRQPrerequisites(owner,true))
@@ -15884,6 +15937,7 @@ void XE::wrapAlderLakeNExecutionWake(void *owner,bool enable,unsigned domains,un
 }
 
 bool XE::wrapTGLHostWait(void *ring,uint32_t *stamp,uint32_t target,uint32_t timeout) {
+ TGLConcurrencyScope concurrent(TGLConcurrency::Wait,ring,UINT64_MAX,target,timeout);
  auto x=static_cast<uint8_t *>(ring);uint32_t n=arrsize(tglHost.wait);
  if (tglHost.owner && *reinterpret_cast<void **>(x+0x10)==tglHost.owner &&
   (tglHost.startupDone || tglHost.startThread==reinterpret_cast<uintptr_t>(current_thread()))) n=__sync_fetch_and_add(&tglHost.waits,1);
@@ -15899,6 +15953,7 @@ bool XE::wrapTGLHostWait(void *ring,uint32_t *stamp,uint32_t target,uint32_t tim
   __atomic_store_n(&r.ready,1,__ATOMIC_RELEASE);tglHostPublish();
  }
  const auto result=FunctionCast(wrapTGLHostWait,callbackXE->orgTGLHostWait)(ring,stamp,target,timeout);
+ concurrent.result=result;
  if (n<arrsize(tglHost.wait)) {
   auto &r=tglHost.wait[n];auto q=r.q+32;tglHostClock(q);q[1]=result;q[3]=target;q[5]=stamp ? *stamp : UINT64_MAX;
   q[31]=tglHost.startupDone;

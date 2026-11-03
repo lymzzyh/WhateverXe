@@ -151,5 +151,6 @@
   "-wex-tahoe-abi": [],
   "-wex-adls-context-cache": [],
   "-wex-adls-bcs-native-wait": [],
-  "-wex-adls-rcs-flush": []
+  "-wex-adls-rcs-flush": [],
+  "-wex-adls-smp-trace": []
 }
