@@ -124,6 +124,8 @@ python3 tools/test.py
 
 Output is under `build/`. AppleIntelTGLCompat is built here and distributed through Graphics. Optional exact-donor tests accept `--donor` and `--accelerator` paths.
 
+The `UHD770` branch also provides [guarded UHD 770 adaptations and reproducible build instructions](docs/UHD770.md). Its GPU-hang mitigations are optional and experimental.
+
 ## License and credits
 
 WhateverXe retains WhateverGreen's copyright notices and BSD-3-Clause license.

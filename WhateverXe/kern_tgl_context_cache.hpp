@@ -5,7 +5,19 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include "kern_xelp_platform.hpp"
+#include "kern_xelp_os.hpp"
 namespace TGLContextCache {
+// The Gen12 cache workaround is present in Linux v6.12 intel_lrc.c for
+// graphics IP 12.0 through 12.10. Hardware validation of this donor path is
+// still pending: admit the opt-in only for the physical ADL-S revision below.
+// A spoofed device-id must never select a context layout for another GPU.
+inline bool adlsRequested(const XELP::Profile &profile,XELP::OS os,
+                          bool hostScheduler,bool exactKernelABI,bool requested) {
+ return requested && exactKernelABI && hostScheduler && os==XELP::OS::Tahoe &&
+  profile.identity==0x46808086 && profile.revision==0x0C &&
+  !profile.overridden() && XELP::same(profile,XELP::identify(0x46808086,0x0C));
+}
 constexpr unsigned BatchOffset=4096, BatchBytes=64, RestoreOffset=0xD<<6;
 inline void batch(void *page) {
  uint32_t words[16] {0x11000001,0x20D8,0x00400040};

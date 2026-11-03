@@ -1,5 +1,6 @@
 #include "kern_display13_color.hpp"
 #include <mach/clock.h>
+#include "kern_local_gamma_endpoint.hpp"
 //
 //  kern_xe.cpp
 //  WhateverGreen
@@ -63,6 +64,7 @@
 #include "kern_donor.hpp"
 #include "kern_tgl_csb.hpp"
 #include "kern_tgl_context_cache.hpp"
+#include "kern_adls_bcs_wait.hpp"
 #include "kern_tgl_gsync.hpp"
 #include "kern_tgl_rpcs.hpp"
 #include "kern_tgl_vm.hpp"
@@ -3223,6 +3225,7 @@ struct TGLGammaObservation {
 	uint64_t writes[1100];
 	uint32_t indexReg, readCount, savedIndex, restoredIndex;
 	uint32_t readback[1024];
+ LocalGammaEndpoint::Stream endpoint;
 };
 TGLGammaObservation tglGammaObservations[4] {};
 IOSimpleLock *tglStreamLock;
@@ -11643,8 +11646,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const bool tahoeTrialScope=!adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
 				(XELP::kernelOS(version)==XELP::OS::Tahoe);
 			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
-			const bool contextCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&2);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
+            const auto localABI=OSDynamicCast(OSBoolean,
+             IORegistryEntry::getRegistryRoot()->getProperty("WEXLocalTahoeABIHookReady"));
+			const bool adlsContextCacheRequested=TGLContextCache::adlsRequested(xeProfile,
+				XELP::kernelOS(version),checkKernelArgument("-disablegfxfirmware"),
+				localABI && localABI->isTrue(),checkKernelArgument("-wex-adls-context-cache"));
+			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlsContextCacheRequested;
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSContextCacheRequested",adlsContextCacheRequested);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",
+				adlsContextCacheRequested ? tglTahoeDisabledTrials&~2U : tglTahoeDisabledTrials,32);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.
 			const uint8_t sameTailFlag[] {0x41,0x80,0xBD,0xC9,0,0,0,0,0x74,0x10,0x41,0xC6,0x85,0xC9,0,0,0,0,0x89,0xC8,0x83,0xC8,0x04,0x89,0x45,0xC0};
@@ -11852,6 +11862,32 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             if(auto live=OSSerializer::forTarget(nullptr,tglSemaphoreSerialize)) {
              IORegistryEntry::getRegistryRoot()->setProperty("TGLSemaphoreTLBLive",live);live->release();
             }
+            // The optional busy-poll batch precedes a separate native hardware
+            // wait in the BCS emitter. This scoped trial omits only that batch;
+            // the native dependency wait and completion values stay intact.
+            const bool bcsNativeWaitRequested=ADLSBCSWait::requested(xeProfile,
+             XELP::kernelOS(version),checkKernelArgument("-disablegfxfirmware"),
+             localABI && localABI->isTrue(),checkKernelArgument("-wex-adls-bcs-native-wait"));
+            bool bcsNativeWaitOK=!bcsNativeWaitRequested;
+            if(bcsNativeWaitRequested) {
+             const char *wait="__ZN24IGHardwareRingBufferBlit16waitForSemaphoreEjj";
+             auto body=reinterpret_cast<uint8_t *>(address+ADLSBCSWait::Offset);
+             bcsNativeWaitOK=hostOK && semaphoreTLBOK &&
+              size>=ADLSBCSWait::Offset+sizeof(ADLSBCSWait::Body) &&
+              patcher.solveSymbol<mach_vm_address_t>(index,wait,address,size)==address+ADLSBCSWait::Offset &&
+              ADLSBCSWait::matches(body,size-ADLSBCSWait::Offset);
+             patcher.clearError();
+             for(unsigned i=0;bcsNativeWaitOK && i<arrsize(ADLSBCSWait::Sites);++i) {
+              auto site=body+ADLSBCSWait::Sites[i];
+              patcher.routeBlock(reinterpret_cast<mach_vm_address_t>(site),ADLSBCSWait::Replace,sizeof(ADLSBCSWait::Replace));
+              bcsNativeWaitOK=patcher.getError()==KernelPatcher::Error::NoError &&
+               !memcmp(site,ADLSBCSWait::Replace,sizeof(ADLSBCSWait::Replace));
+              patcher.clearError();
+             }
+             bcsNativeWaitOK=bcsNativeWaitOK && ADLSBCSWait::matches(body,sizeof(ADLSBCSWait::Body),true);
+            }
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSBCSNativeWaitRequested",bcsNativeWaitRequested);
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLBCSNativeWaitReady",bcsNativeWaitRequested && bcsNativeWaitOK);
 			// r120: failure-path capture only. Native dumpBatchBuffer is a stub;
 			// reuse the native pending resource cache and saved debug registers.
 			const char *hangDump="__ZN20IGHardwareRingBuffer14dumpRingBufferER14debugRegisters";
@@ -11925,8 +11961,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassReady",recoveryRequested && recoveryOK);
-			tglAcceleratorReady = surfaceABIReady && adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && hangOK && recoveryOK && completionCacheOK && contextCacheOK;
+			tglAcceleratorReady = surfaceABIReady && adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && bcsNativeWaitOK && hangOK && recoveryOK && completionCacheOK && contextCacheOK;
 			// r201: resource/copy diagnostics are absent, not admission requirements.
+			if(checkKernelArgument("-wex-tahoe-abi")) {
+				const auto qualified=OSDynamicCast(OSBoolean,IORegistryEntry::getRegistryRoot()->getProperty("WEXLocalTahoeABIHookReady"));
+				tglAcceleratorReady=tglAcceleratorReady && qualified && qualified->isTrue();
+			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLResourceDiagnosticsRemoved",true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorAdmissionReady", tglAcceleratorReady);
 			patcher.clearError();
@@ -19007,6 +19047,10 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 	tglStreamAck(access, reg, value, 0, __builtin_return_address(0));
 	auto irq=reg==0x190010 ? tglFBIRQBegin(0,callbackXE->tglObservationController,value,
 		reinterpret_cast<uintptr_t>(__builtin_return_address(0))) : nullptr;
+ const auto thread = reinterpret_cast<uintptr_t>(current_thread());
+ for(auto &slot:tglGammaObservations)if(__sync_fetch_and_add(&slot.thread,0)==thread) {
+  slot.endpoint.write(reinterpret_cast<uintptr_t>(access),reg,value);break;
+ }
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(36,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
 	FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, reg, value);
@@ -19025,7 +19069,6 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
  if(trace)tglTransitionRecord(36,true,access,reg,tglConnectionCaller(__builtin_return_address(0)),value);
 	tglFBIRQEnd(irq,0);
 	if (reg < 0x4A000 || reg >= 0x4C000) return;
-	const auto thread = reinterpret_cast<uintptr_t>(current_thread());
 	for (auto &slot : tglGammaObservations) if (__sync_fetch_and_add(&slot.thread, 0) == thread) {
 		if (slot.count < arrsize(slot.writes)) slot.writes[slot.count++] = (uint64_t(reg) << 32) | value;
 		else ++slot.dropped;
@@ -19068,12 +19111,14 @@ void XE::wrapTGLGamma10(void *path, void *transaction, uint32_t control) {
 	TGLGammaObservation *slot = nullptr;
 	// A nested upload is retained but marks its parent's record ambiguous.
 	for (auto &entry : tglGammaObservations) if (__sync_fetch_and_add(&entry.thread, 0) == thread) {
+		entry.endpoint.eligible=false;
 		FunctionCast(wrapTGLGamma10, callbackXE->orgTGLGamma10)(path, transaction, control);
 		++entry.dropped;
 		return;
 	}
 	for (auto &entry : tglGammaObservations) if (__sync_bool_compare_and_swap(&entry.thread, 0, thread)) {
 		slot = &entry; slot->count = slot->dropped = slot->readCount = 0;
+		slot->endpoint={};
 		slot->savedIndex = slot->restoredIndex = slot->indexReg = 0; break;
 	}
 	uint64_t r[32] {}, uptime;
@@ -19091,6 +19136,16 @@ void XE::wrapTGLGamma10(void *path, void *transaction, uint32_t control) {
 	for (uint32_t i=0; i<9; ++i) r[12+i] = *reinterpret_cast<uint32_t *>(p + 0x14 + 4*i);
 	if (slot && r[6] < 3 && r[12] == 0x4A400 + 0x800*r[6] && r[13] == r[12]+4 &&
 		r[17] == r[12]+0x30) slot->indexReg = static_cast<uint32_t>(r[12]);
+ if(slot && fb && slot->indexReg) {
+  auto ctl=*reinterpret_cast<uint8_t **>(fb+0x1D0);
+  auto access=*reinterpret_cast<void **>(fb+0x4A40);
+  const auto ready=OSDynamicCast(OSBoolean,IORegistryEntry::getRegistryRoot()->getProperty("WEXLocalTahoeABIHookReady"));
+  const bool qualified=callbackXE->adlsDisplaySelected && callbackXE->xeProfile.identity==0x46808086 &&
+   callbackXE->xeProfile.revision==0x0c && !callbackXE->xeProfile.overridden() && ready && ready->isTrue() &&
+   checkKernelArgument("-wex-tahoe-abi") && ctl==callbackXE->tglObservationController &&
+   ctl && access==*reinterpret_cast<void **>(ctl+0xC40);
+  slot->endpoint.begin(qualified,reinterpret_cast<uintptr_t>(access),r[6],r[12],r[13],r[11]==6);
+ }
 	clock_get_uptime(&uptime); absolutetime_to_nanoseconds(uptime, &r[0]);
 	FunctionCast(wrapTGLGamma10, callbackXE->orgTGLGamma10)(path, transaction, control);
 	clock_get_uptime(&uptime); absolutetime_to_nanoseconds(uptime, &r[1]);
@@ -19107,6 +19162,13 @@ void XE::wrapTGLGamma10(void *path, void *transaction, uint32_t control) {
 		root->setProperty(key, r, sizeof(r));
 	}
 	if (slot) {
+  if(slot->endpoint.samples || (slot->count && r[11]==6)) {
+   uint32_t endpoint[20] {6,static_cast<uint32_t>(r[2]),static_cast<uint32_t>(r[6]),
+    slot->endpoint.samples,slot->endpoint.mask,slot->endpoint.rejected,static_cast<uint32_t>(slot->endpoint.eligible),static_cast<uint32_t>(r[11])};
+   for(unsigned i=0;i<6;++i){endpoint[8+i]=slot->endpoint.original[i];endpoint[14+i]=slot->endpoint.actual[i];}
+   snprintf(key,sizeof(key),"WEXLocalGammaEndpointPipe%u",static_cast<unsigned>(r[6]));
+   root->setProperty(key,endpoint,sizeof(endpoint));
+  }
 		if (slot->readCount) {
 			snprintf(key, sizeof(key), "TGLGammaReadLast%u", static_cast<uint32_t>(r[2]) % 16);
 			root->setProperty(key, slot->readback, sizeof(slot->readback));

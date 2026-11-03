@@ -2,6 +2,28 @@
 #include <cassert>
 #include <array>
 int main() {
+ const auto admitted=XELP::identify(0x46808086,0x0C);
+ assert(TGLContextCache::adlsRequested(admitted,XELP::OS::Tahoe,true,true,true));
+ // Selection must fail closed across every other physical device/stepping,
+ // even if its device-id override asks for the admitted donor family.
+ for(const auto &device:XELP::DeviceTable) for(unsigned revision=0;revision<=255;++revision) {
+  const uint32_t identity=(uint32_t(device.device)<<16)|0x8086;
+  const auto physical=XELP::identify(identity,revision);
+  const bool expected=identity==0x46808086 && revision==0x0C;
+  assert(TGLContextCache::adlsRequested(physical,XELP::OS::Tahoe,true,true,true)==expected);
+  if(!expected) {
+   const auto spoofed=XELP::identify(identity,revision,0x46808086);
+   assert(!TGLContextCache::adlsRequested(spoofed,XELP::OS::Tahoe,true,true,true));
+  }
+ }
+ for(auto os:{XELP::OS::Unknown,XELP::OS::Donor,XELP::OS::BigSur,XELP::OS::Monterey,
+              XELP::OS::Ventura,XELP::OS::Sonoma,XELP::OS::Sequoia})
+  assert(!TGLContextCache::adlsRequested(admitted,os,true,true,true));
+ assert(!TGLContextCache::adlsRequested(admitted,XELP::OS::Tahoe,false,true,true));
+ assert(!TGLContextCache::adlsRequested(admitted,XELP::OS::Tahoe,true,true,false));
+ assert(!TGLContextCache::adlsRequested(admitted,XELP::OS::Tahoe,true,false,true));
+ auto altered=admitted;altered.gt=XELP::GT::Unknown;
+ assert(!TGLContextCache::adlsRequested(altered,XELP::OS::Tahoe,true,true,true));
  std::array<uint8_t,81920> image{},before{};std::array<uint8_t,8192> page{};
  const uint64_t gpu=0x402b3000;const uint32_t fields[]={0x21C0,uint32_t(gpu|5),0x21C4,0,0x21C8,0};
  memcpy(image.data()+0x1048,fields,sizeof(fields));before=image;

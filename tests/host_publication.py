@@ -45,6 +45,9 @@ struct KernelPatcher {
 };
 // The optional observer is inactive in this host-publication fixture.
 namespace XeDataAccess {bool processKext(KernelPatcher&,size_t,mach_vm_address_t,size_t){return false;}void processKernel(KernelPatcher &){assert(published);events.push_back(7);}}
+// The ABI payload loader is covered by a separate native driver replay. This
+// fixture checks its call site remains after successful PCI publication.
+static void prepareLocalTahoeABI(KernelPatcher &,IOPCIDevice *gpu,const XELP::Profile &){assert(gpu && published);}
 struct Graphics {size_t loadIndex=4;bool off=false;void switchOff(){off=true;}} graphics;
 struct {size_t loadIndex=5;}backlight;
 struct XeHost {

@@ -5,7 +5,96 @@
 #include "kern_backlight_profile.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
+#include <Headers/kern_mach.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <sys/vnode.h>
+#include "kern_local_tahoe_abi.hpp"
+extern "C" const char version[];
+static mach_vm_address_t localTahoeOriginalPage;
+static bool localTahoeHookReady;
+static uint64_t localTahoePagesPatched;
+static uint64_t localVideoPagesPatched;
+static uint64_t localGVAPagesPatched;
+static bool localTahoeSerialize(void *,void *,OSSerialize *serial) {
+ uint64_t state[] {9,localTahoeHookReady,__atomic_load_n(&localTahoePagesPatched,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(state,sizeof(state));
+ const bool ok=data && data->serialize(serial);
+ if(data)data->release();
+ return ok;
+}
+static bool localVideoSerialize(void *,void *,OSSerialize *serial) {
+ uint64_t state[] {9,localTahoeHookReady,__atomic_load_n(&localVideoPagesPatched,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(state,sizeof(state));
+ const bool ok=data && data->serialize(serial);
+ if(data)data->release();
+ return ok;
+}
+static bool localGVASerialize(void *,void *,OSSerialize *serial) {
+ uint64_t state[] {9,localTahoeHookReady,__atomic_load_n(&localGVAPagesPatched,__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(state,sizeof(state));
+ const bool ok=data && data->serialize(serial);
+ if(data)data->release();
+ return ok;
+}
+// Tahoe cs_validate_page has seven parameters and returns its results through
+// three pointers. The older five-parameter boolean-returning Lilu wrapper is
+// not its ABI. Preserve the validator's outputs, including the seventh (stack)
+// argument and the executable-page decision.
+using LocalTahoePageValidator=void (*)(vnode_t,memory_object_t,
+ memory_object_offset_t,const void *,int *,int *,int *);
+static void localTahoeValidatePage(vnode_t node,memory_object_t pager,
+ memory_object_offset_t offset,const void *data,int *validated,int *tainted,int *nx) {
+ reinterpret_cast<LocalTahoePageValidator>(localTahoeOriginalPage)(node,pager,offset,data,validated,tainted,nx);
+ // This exact x86_64 kernel reports a fully validated 4K page as 0xf.
+ const bool accepted=validated && tainted && nx && *validated==0xf && !*tainted && !*nx;
+ if(localTahoeHookReady &&
+    (LocalTahoeABI::matches(data,PAGE_SIZE,offset,accepted,false) ||
+     LocalVideoABI::matches(data,PAGE_SIZE,offset,accepted,false) ||
+     LocalGVA::matches(data,PAGE_SIZE,offset,accepted,false))) {
+  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)==KERN_SUCCESS) {
+   // Page validation may race with another reader. Recheck under the write lock.
+   if(LocalTahoeABI::matches(data,PAGE_SIZE,offset,accepted,false)) {
+    LocalTahoeABI::apply(const_cast<void *>(data));
+    __atomic_fetch_add(&localTahoePagesPatched,1ULL,__ATOMIC_RELAXED);
+   } else if(LocalVideoABI::matches(data,PAGE_SIZE,offset,accepted,false)) {
+    LocalVideoABI::apply(const_cast<void *>(data));
+    __atomic_fetch_add(&localVideoPagesPatched,1ULL,__ATOMIC_RELAXED);
+   } else if(LocalGVA::matches(data,PAGE_SIZE,offset,accepted,false)) {
+    LocalGVA::apply(const_cast<void *>(data));
+    __atomic_fetch_add(&localGVAPagesPatched,1ULL,__ATOMIC_RELAXED);
+   }
+   MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
+  }
+ }
+}
+static_assert(__is_same(decltype(&localTahoeValidatePage),LocalTahoePageValidator),"Tahoe page validator ABI");
+static void prepareLocalTahoeABI(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile) {
+ if(!checkKernelArgument("-wex-tahoe-abi"))return;
+ static_assert(PAGE_SIZE==LocalTahoeABI::PageSize,"reference page size");
+ // No filesystem access or product-build sysctl dependency during early init.
+ // Kernel identity is constant before BSD/VFS initialization; payload identity
+ // is enforced later, after the original page validator accepts the whole page.
+ const bool qualified=getKernelVersion()==KernelVersion::Tahoe && gpu &&
+  profile.identity==0x46808086 && profile.revision==0x0c && !profile.overridden() &&
+  XELP::same(profile,XELP::identify(0x46808086,0x0c)) &&
+  !strcmp(version,"Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64");
+ if(qualified) {
+  KernelPatcher::RouteRequest route("_cs_validate_page",localTahoeValidatePage,localTahoeOriginalPage);
+  localTahoeHookReady=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);
+  patcher.clearError();
+ }
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXLocalTahoeABIHookReady",localTahoeHookReady);
+ if(auto live=OSSerializer::forTarget(nullptr,localTahoeSerialize)) {
+  root->setProperty("WEXLocalTahoeABILive",live);live->release();
+ }
+ if(auto live=OSSerializer::forTarget(nullptr,localVideoSerialize)) {
+  root->setProperty("WEXLocalVideoABILive",live);live->release();
+ }
+ if(auto live=OSSerializer::forTarget(nullptr,localGVASerialize)) {
+  root->setProperty("WEXLocalGVALive",live);live->release();
+ }
+}
 XeHost *XeHost::callbackHost;
 struct FramebufferViewer : public IOFramebuffer {
  static IOMemoryMap *&getVramMap(IOFramebuffer *fb) { return static_cast<FramebufferViewer *>(fb)->fVramMap; }
@@ -50,6 +139,7 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  if(!active && (profile.family==XELP::Family::AlderLakeS ||
                 profile.family==XELP::Family::AlderLakeP))xe.processKernel(patcher,info);
  if(active) {
+  if(info->firmwareVendor!=DeviceInfo::FirmwareVendor::Apple)prepareLocalTahoeABI(patcher,gpu,profile);
   XeDataAccess::processKernel(patcher);
   // Xe admission reads physical PCI identity. Do not install WEG's ID spoof hooks.
   // WEG normalizes the ME device discovered by Lilu for Apple's name matching.

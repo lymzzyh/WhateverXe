@@ -124,6 +124,8 @@ python3 tools/test.py
 
 出力先は`build/`です。AppleIntelTGLCompatもここでビルドし、Graphicsで配布します。任意の実ドライバー再生試験には`--donor`・`--accelerator`で対応する原本を指定します。
 
+`UHD770`ブランチには[条件を限定したUHD 770対応と再現可能なビルド手順](docs/UHD770.md)も含まれます。GPUハングの緩和策は任意の実験的機能です。
+
 ## ライセンスとクレジット
 
 WhateverXeはWhateverGreenの著作権表示とBSD-3-Clauseライセンスを継承しています。[LICENSE.txt](LICENSE.txt)を参照してください。LiluとMacKernelSDKは別の依存コンポーネントです。
