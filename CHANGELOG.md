@@ -6,6 +6,8 @@ Use the latest [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphi
 
 ### Added
 
+- Add an opt-in native context restore for repeated equal-TAIL submissions on the guarded UHD 770 Tahoe configuration, with nonblocking diagnostic state access. Hardware validation remains experimental; the context-reload approach follows Linux i915.
+
 - Add an opt-in outer render write-fence tile-cache flush for the guarded UHD 770 Tahoe configuration. Hardware stability remains experimental; see [UHD770 configuration](docs/UHD770.md).
 - Add optional bounded CPU concurrency diagnostics for the guarded UHD 770 Tahoe configuration, preserving recent calls and the first pre-reset state without changing native scheduling.
 - Add USB-C DisplayPort Alt Mode output on Alder Lake-class GPUs, including multi-display startup and reconnection.

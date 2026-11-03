@@ -12,6 +12,36 @@ struct State {
  // schema, attempts, valid, retained active item, same tail, forced, native forced, rejected
  uint64_t counts[8] {1};
 };
+// Bookkeeping only: never hold this guard over a native GPU submission or
+// wait for another CPU. A contended diagnostic read is explicitly unavailable.
+struct Tracker {
+ State state{};
+ uint32_t busy{};
+ uint64_t skipped{};
+ uint64_t invalidations{},seenInvalidations{};
+ bool acquire() {
+  uint32_t free=0;
+  if(__atomic_compare_exchange_n(&busy,&free,1U,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return true;
+  __atomic_fetch_add(&skipped,1ULL,__ATOMIC_RELAXED);return false;
+ }
+ void release() {__atomic_store_n(&busy,0U,__ATOMIC_RELEASE);}
+ bool begin() {
+  if(!acquire()) {
+   __atomic_fetch_add(&invalidations,1ULL,__ATOMIC_RELEASE);return false;
+  }
+  const auto epoch=__atomic_load_n(&invalidations,__ATOMIC_ACQUIRE);
+  if(epoch!=seenInvalidations) {state.previous={};seenInvalidations=epoch;}
+  return true;
+ }
+ bool snapshot(State &out) {
+  if(!acquire())return false;
+  out=state;release();return true;
+ }
+ void invalidate() {
+  if(!begin())return;
+  state.previous={};release();
+ }
+};
 // Linux execlists_update_context avoids equal TAIL lite restores. Apply only
 // to an unchanged active first work item whose prior submission we witnessed.
 // A new item/context, advanced tail, reset generation or failed read declines.
@@ -50,6 +80,12 @@ void prepare(State &s,uint64_t owner,uint64_t streamer,uint64_t generation,Read 
   }
  }
  s.previous=e;
+}
+template<class Read,class Force>
+void prepare(Tracker &tracker,uint64_t owner,uint64_t streamer,uint64_t generation,Read read,Force force) {
+ if(!tracker.begin())return;
+ prepare(tracker.state,owner,streamer,generation,read,force);
+ tracker.release();
 }
 }
 #endif

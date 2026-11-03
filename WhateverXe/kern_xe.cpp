@@ -136,7 +136,9 @@ static bool tglHangPreStopReady=false;
 static uint32_t tglHangPreStopState;
 static TGLHangPreStop::Capture tglHangPreStopCapture{};
 static bool tglSameTailEnabled;
-static TGLSameTail::State tglSameTailState{},tglSameTailFailure{};
+static TGLSameTail::Tracker tglSameTailTracker{};
+static TGLSameTail::State tglSameTailFailure{};
+static bool tglSameTailFailureValid;
 static TGLSubmitHistory::History<> tglSubmitHistory;
 static bool tglSameTailSerialize(void *,void *,OSSerialize *);
 static bool tglGSYNCReady,tglGSYNCObserveReady;
@@ -11700,8 +11702,6 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				localABI && localABI->isTrue(),checkKernelArgument("-wex-adls-context-cache"));
 			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlsContextCacheRequested;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSContextCacheRequested",adlsContextCacheRequested);
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",
-				adlsContextCacheRequested ? tglTahoeDisabledTrials&~2U : tglTahoeDisabledTrials,32);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.
 			const uint8_t sameTailFlag[] {0x41,0x80,0xBD,0xC9,0,0,0,0,0x74,0x10,0x41,0xC6,0x85,0xC9,0,0,0,0,0x89,0xC8,0x83,0xC8,0x04,0x89,0x45,0xC0};
@@ -11709,8 +11709,16 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN17IGHardwareContext14updateRingTailEj",address,size)==address+0x7C5B6 &&
 				!memcmp(reinterpret_cast<void *>(address+0x3A7B6),sameTailFlag,sizeof(sameTailFlag));
 			patcher.clearError();
-			tglSameTailRestoreEnabled=tglSameTailEnabled && !(tglTahoeDisabledTrials&4);
+			const bool adlsSameTailRequested=ADLSRCSFlush::requested(xeProfile,
+				XELP::kernelOS(version),checkKernelArgument("-disablegfxfirmware"),
+				localABI && localABI->isTrue(),checkKernelArgument("-wex-adls-same-tail"));
+			tglSameTailRestoreEnabled=tglSameTailEnabled &&
+				(!(tglTahoeDisabledTrials&4) || adlsSameTailRequested);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSSameTailRequested",adlsSameTailRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailRestoreReady",tglSameTailRestoreEnabled);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",
+				tglTahoeDisabledTrials & ~(adlsContextCacheRequested ? 2U : 0U) &
+				~(adlsSameTailRequested && tglSameTailRestoreEnabled ? 4U : 0U),32);
 			// The public TGL register definition identifies colored GSYNC at
 			// B0A0[2]. Restrict this repair trial to the physical TGL B0 target,
 			// exact Tahoe kernel/donor and the qualified strong-UC mapping.
@@ -15420,7 +15428,7 @@ extern "C" void tglHangPreStopWake(void *owner,bool enable,unsigned domains,unsi
  auto base=tglHostBase();if(!base)return;
  uint32_t empty=0;
  if(!__atomic_compare_exchange_n(&tglHangPreStopState,&empty,1U,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return;
- tglSameTailFailure=tglSameTailState;
+ tglSameTailFailureValid=tglSameTailTracker.snapshot(tglSameTailFailure);
  if(tglGSYNCReady) {
   for(unsigned i=0;i<16;++i)tglGSYNCFailure[i]=__atomic_load_n(tglGSYNCState+i,__ATOMIC_RELAXED);
   const auto ack=*reinterpret_cast<volatile uint32_t *>(base+0xD84);
@@ -15464,8 +15472,11 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
   if (slot==0) {
    if(__atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
     IORegistryEntry::getRegistryRoot()->setProperty("TGLHangPreStop0",&tglHangPreStopCapture,sizeof(tglHangPreStopCapture));
-   if(tglSameTailEnabled && __atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
-    IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTail0",&tglSameTailFailure,sizeof(tglSameTailFailure));
+   if(tglSameTailEnabled && __atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2) {
+    IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTailCaptureValid",tglSameTailFailureValid);
+    if(tglSameTailFailureValid)
+     IORegistryEntry::getRegistryRoot()->setProperty("TGLSameTail0",&tglSameTailFailure,sizeof(tglSameTailFailure));
+   }
    if(tglSameTailEnabled)tglSubmitHistoryPublish();
    if(tglGSYNCReady && __atomic_load_n(&tglHangPreStopState,__ATOMIC_ACQUIRE)==2)
     IORegistryEntry::getRegistryRoot()->setProperty("TGLGSYNC0",tglGSYNCFailure,sizeof(tglGSYNCFailure));
@@ -15710,8 +15721,13 @@ void XE::wrapTGLHostCSBIDPanic(const uint32_t *entry) {
 }
 
 static bool tglSameTailSerialize(void *,void *,OSSerialize *serializer) {
- // Live counters only; use the pre-STOP copy for a failure-boundary receipt.
- auto data=OSData::withBytes(tglSameTailState.counts,sizeof(tglSameTailState.counts));
+ // Schema2: counters[1..7], valid snapshot, contention skips. Do not copy a
+ // mutable State concurrently or hold its guard during allocation/serialization.
+ TGLSameTail::State copy{};uint64_t q[10]{};
+ q[0]=2;q[8]=tglSameTailTracker.snapshot(copy);
+ if(q[8])memcpy(q+1,copy.counts+1,7*sizeof(uint64_t));
+ q[9]=__atomic_load_n(&tglSameTailTracker.skipped,__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(q,sizeof(q));
  if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -15877,9 +15893,9 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    return TGLHangPending::kernelRange(p,n) ? tglVM.nofault(p,reinterpret_cast<uint64_t>(out),n) : 0;
   };
   auto force=[](uint64_t p){*reinterpret_cast<uint8_t *>(p)=1;};
-  TGLSameTail::prepare(tglSameTailState,reinterpret_cast<uint64_t>(renderWakeOwner),
+  TGLSameTail::prepare(tglSameTailTracker,reinterpret_cast<uint64_t>(renderWakeOwner),
    reinterpret_cast<uint64_t>(streamer),tglCSBEngines[0].resets,read,force);
- } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailState.previous={};
+ } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailTracker.invalidate();
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,0);
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,1);

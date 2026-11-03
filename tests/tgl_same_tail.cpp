@@ -3,6 +3,9 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
+#include <thread>
+#include <vector>
 int main() {
  std::array<uint8_t,0x80> streamer{},desc{},buffer{};
  std::array<uint8_t,0x100> context{};
@@ -43,5 +46,32 @@ int main() {
   put(image,0x101c,0x3051,4);run(2);assert(writes==3);
   put(image,0x101c,0x3050,4);put(streamer,0x50,2,4);run(2);assert(writes==3);
  }
+ // A newly selected first item becomes the retained first item in the other
+ // bank, without a TAIL advance. This is different from an already-active item
+ // being submitted twice in one bank; both must request the native one-shot.
+ put(desc,0,0,1);put(context,0x50,owner);put(buffer,0x20,image.size());
+ put(image,0x101c,0x7470,4);put(streamer,0x50,1,4);
+ put(streamer,0x30,ip);put(streamer,0x40,reinterpret_cast<uint64_t>(other.data()));
+ TGLSameTail::Tracker tracker;writes=0;
+ auto run=[&]{TGLSameTail::prepare(tracker,owner,sp,7,read,force);};
+ run();assert(!writes);
+ put(streamer,0x50,0,4);put(streamer,0x40,ip);run();assert(writes==1);
+ // No spin or stale-history reuse if a diagnostic reader or another writer
+ // temporarily owns bookkeeping. Native submission is never under this guard.
+ assert(tracker.acquire());run();TGLSameTail::State snap;
+ assert(!tracker.snapshot(snap));tracker.release();
+ run();assert(writes==1);run();assert(writes==2);
+ assert(tracker.snapshot(snap) && snap.counts[5]==2);
+ // Concurrent readers and writers exercise the actual bookkeeping guard.
+ // The immutable fake native object deliberately needs no native lock here.
+ std::atomic<bool> done{false};std::atomic<unsigned> scans{0};
+ std::thread reader([&]{TGLSameTail::State s;while(!done.load()) {
+  if(tracker.snapshot(s)) {assert(s.counts[5]<=s.counts[4] && s.counts[4]<=s.counts[3]);++scans;}
+ }});
+ std::vector<std::thread> workers;
+ for(unsigned i=0;i<8;++i)workers.emplace_back([&]{for(unsigned n=0;n<4000;++n)run();});
+ for(auto &w:workers)w.join();done=true;reader.join();
+ assert(tracker.snapshot(snap) && scans && snap.counts[5]==writes);
  puts("PASS same-tail: both banks, advancing tail, active-item identity, epoch, prior native flag, failed reads and layout guards");
+ puts("PASS same-tail: bank transition, nonblocking contention invalidation and 32000 concurrent attempts with snapshots");
 }

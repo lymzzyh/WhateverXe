@@ -152,5 +152,6 @@
   "-wex-adls-context-cache": [],
   "-wex-adls-bcs-native-wait": [],
   "-wex-adls-rcs-flush": [],
-  "-wex-adls-smp-trace": []
+  "-wex-adls-smp-trace": [],
+  "-wex-adls-same-tail": []
 }
