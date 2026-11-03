@@ -65,6 +65,7 @@
 #include "kern_tgl_csb.hpp"
 #include "kern_tgl_context_cache.hpp"
 #include "kern_adls_bcs_wait.hpp"
+#include "kern_adls_rcs_flush.hpp"
 #include "kern_tgl_gsync.hpp"
 #include "kern_tgl_rpcs.hpp"
 #include "kern_tgl_vm.hpp"
@@ -11618,6 +11619,23 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				{0x48,0xB9,0x04,0x02,0x00,0x7A,0x21,0x70,0x10,0x40},
 				{0x48,0xBF,0x04,0x02,0x00,0x7A,0x21,0x72,0x10,0x50},
 				{0x48,0xBB,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x20}};
+			const auto flushABI=OSDynamicCast(OSBoolean,
+				IORegistryEntry::getRegistryRoot()->getProperty("WEXLocalTahoeABIHookReady"));
+			const bool adlsRCSFlushRequested=ADLSRCSFlush::requested(xeProfile,
+				XELP::kernelOS(version),checkKernelArgument("-disablegfxfirmware"),
+				flushABI && flushABI->isTrue(),checkKernelArgument("-wex-adls-rcs-flush"));
+			uint8_t selectedFlush[arrsize(flushReplace)][sizeof(flushReplace[0])];
+			memcpy(selectedFlush,flushReplace,sizeof(selectedFlush));
+			if(adlsRCSFlushRequested) {
+				// TGL PRM Vol2a PIPE_CONTROL DW1[28]: tile cache must be flushed
+				// for write fences. Linux v6.12 gen12_emit_fini_breadcrumb_rcs
+				// also includes it before the completion write. The render-pass
+				// emitter already has it; complete the two outer-ring emitters.
+				// Only this bit changes: retain HDC/depth stalls, addresses,
+				// post-sync values, packet count, notification and native order.
+				selectedFlush[0][9]|=0x10;
+				selectedFlush[1][9]|=0x10;
+			}
 			bool flushOK=size>0x85410 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain18commitStampCommandEjb",address,size)==address+0x84DC8 &&
 				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN24IGHardwareRingBufferMain10writeFlushEv",address,size)==address+0x853A6;
@@ -11630,10 +11648,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			patcher.clearError();
 			for (size_t n=0;flushOK && n<arrsize(flushSites);++n) {
 				auto site=reinterpret_cast<uint8_t *>(address+flushSites[n]);
-				KernelPatcher::LookupPatch patch {currentGraphics,flushFind[n],flushReplace[n],sizeof(flushFind[n]),1};
+				KernelPatcher::LookupPatch patch {currentGraphics,flushFind[n],selectedFlush[n],sizeof(flushFind[n]),1};
 				patcher.applyLookupPatch(&patch,site,sizeof(flushFind[n])+1);
-				flushOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,flushReplace[n],sizeof(flushReplace[n]));
+				flushOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,selectedFlush[n],sizeof(selectedFlush[n]));
 			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSRCSFlushRequested",adlsRCSFlushRequested);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSRCSFlushReady",adlsRCSFlushRequested && flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRCSCompletionFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassTileFlushReady",flushOK);

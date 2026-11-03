@@ -150,5 +150,6 @@
   "-wex-dsi-power-test": [],
   "-wex-tahoe-abi": [],
   "-wex-adls-context-cache": [],
-  "-wex-adls-bcs-native-wait": []
+  "-wex-adls-bcs-native-wait": [],
+  "-wex-adls-rcs-flush": []
 }
