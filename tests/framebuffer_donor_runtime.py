@@ -33,6 +33,7 @@ struct IORegistryEntry {
  void setProperty(const char *,const void *,size_t){}
 };
 #define SYSLOG(...) do {} while (0)
+#define DBGLOG(...) ((void)0)
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 struct XE {uintptr_t orgTGLHDCP2Init;static bool wrapTGLHDCP2Init(void *,void *);};
 XE state{},*callbackXE=&state;

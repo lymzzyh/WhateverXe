@@ -153,5 +153,6 @@
   "-wex-adls-bcs-native-wait": [],
   "-wex-adls-rcs-flush": [],
   "-wex-adls-smp-trace": [],
-  "-wex-adls-same-tail": []
+  "-wex-adls-same-tail": [],
+  "-wex-adls-release": []
 }

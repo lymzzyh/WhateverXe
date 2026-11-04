@@ -35,6 +35,7 @@ struct IORegistryEntry {
 void clock_get_uptime(uint64_t *p) { *p = 0; }
 void absolutetime_to_nanoseconds(uint64_t t, uint64_t *p) { *p = t; }
 #define SYSLOG(...) ((void)0)
+#define DBGLOG(...) ((void)0)
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 constexpr uint32_t kIOReturnBusy = 0xe00002d5;

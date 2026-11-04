@@ -6,14 +6,16 @@ Use the latest [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphi
 
 ### Added
 
-- Add an opt-in native context restore for repeated equal-TAIL submissions on the guarded UHD 770 Tahoe configuration, with nonblocking diagnostic state access. Hardware validation remains experimental; the context-reload approach follows Linux i915.
+- Add quiet release operation for the guarded UHD 770 Tahoe configuration, disabling optional capture and tracing while preserving the hang fixes.
 
-- Add an opt-in outer render write-fence tile-cache flush for the guarded UHD 770 Tahoe configuration. Hardware stability remains experimental; see [UHD770 configuration](docs/UHD770.md).
+- Add an opt-in outer render write-fence tile-cache flush for the guarded UHD 770 Tahoe configuration. See [UHD770 configuration](docs/UHD770.md).
 - Add optional bounded CPU concurrency diagnostics for the guarded UHD 770 Tahoe configuration, preserving recent calls and the first pre-reset state without changing native scheduling.
 - Add USB-C DisplayPort Alt Mode output on Alder Lake-class GPUs, including multi-display startup and reconnection.
 - Add experimental MIPI DSI display support with graphics acceleration, brightness control, display off/on, rotation, HiDPI and external-display coexistence. Tested on GPD MicroPC 2 and CHUWI MiniBook X N100 only; do not expect it to work on other devices. System sleep/wake remains unsupported.
 
 ### Fixed
+
+- Fix GPU stalls from repeated equal-TAIL submissions on the guarded UHD 770 Tahoe configuration with an opt-in native context restore. The context-reload approach follows Linux i915.
 
 - Fix graphics initialization and acceleration on additional supported Tiger Lake and Alder/Raptor Lake GPU variants, including single-channel configurations.
 - Fix graphics initialization on compatible Sequoia and Tahoe updates without requiring an exact OS build match.

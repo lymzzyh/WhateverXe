@@ -124,7 +124,7 @@ python3 tools/test.py
 
 Output is under `build/`. AppleIntelTGLCompat is built here and distributed through Graphics. Optional exact-donor tests accept `--donor` and `--accelerator` paths.
 
-The `UHD770` branch also provides [guarded UHD 770 adaptations and reproducible build instructions](docs/UHD770.md). Its context-cache, blitter-wait, render write-fence and repeated-context submission mitigations are optional and experimental. Optional concurrency diagnostics help investigate remaining hangs.
+The `UHD770` branch also provides [guarded UHD 770 adaptations and reproducible build instructions](docs/UHD770.md). Its guarded hang fix combines context-cache, blitter-wait, render write-fence and repeated-context submission corrections. A quiet release configuration is available for normal operation.
 
 ## License and credits
 

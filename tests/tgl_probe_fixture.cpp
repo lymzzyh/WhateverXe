@@ -11,6 +11,7 @@
 struct IOService;
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 #define SYSLOG(...)
+#define DBGLOG(...) ((void)0)
 #define FunctionCast(fn,address) reinterpret_cast<decltype(&fn)>(address)
 constexpr uint32_t tglConnectionEvents=7,tglConnectionCapacity=64;
 struct TGLConnectionRecord { uint64_t q[32]; };

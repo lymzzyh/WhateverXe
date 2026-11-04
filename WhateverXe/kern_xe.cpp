@@ -102,6 +102,8 @@
 #include <libkern/c++/OSData.h>
 
 extern "C" const char version[];
+// Published during accelerator admission, before native work can start.
+static bool tglReleaseMode;
 static bool tglConcurrencyEnabled;
 static TGLConcurrency::Trace<> tglConcurrency;
 static uint64_t tglConcurrencyNow() {
@@ -11380,7 +11382,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			KernelPatcher::RouteRequest request("__ZN16IntelAccelerator5startEP9IOService",
 				wrapTGLAcceleratorStart, orgTGLAcceleratorStart);
 			const bool ok = patcher.routeMultiple(index, &request, 1, address, size);
-			SYSLOG("igfx", "TGL accelerator start route=%d", ok);
+			DBGLOG("igfx", "TGL accelerator start route=%d", ok);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGAcceleratorStartRouted", ok);
 			// Check native helper bytes BEFORE existing GuC diagnostic routes.
 			// PRM Vol2c part1 pp121-124: valid + force even for empty ring restore.
@@ -11702,6 +11704,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				localABI && localABI->isTrue(),checkKernelArgument("-wex-adls-context-cache"));
 			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlsContextCacheRequested;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSContextCacheRequested",adlsContextCacheRequested);
+            // Quiet operation is restricted to the same qualified local target.
+            // It only disables instrumentation; fix admission remains independent.
+            tglReleaseMode=ADLSRCSFlush::requested(xeProfile,XELP::kernelOS(version),
+             checkKernelArgument("-disablegfxfirmware"),localABI && localABI->isTrue(),
+             checkKernelArgument("-wex-adls-release"));
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLADLSReleaseMode",tglReleaseMode);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.
 			const uint8_t sameTailFlag[] {0x41,0x80,0xBD,0xC9,0,0,0,0,0x74,0x10,0x41,0xC6,0x85,0xC9,0,0,0,0,0x89,0xC8,0x83,0xC8,0x04,0x89,0x45,0xC0};
@@ -11953,17 +11961,17 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const auto pgClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV31IGHardwarePerProcessPageTable64",address,size);
 			hangOK=hangOK && pgClass==address+0xCC220 && tglVM.enabled;
 			if (hangOK) tglPPGTTClass=pgClass+16;
-			if (hangOK) {
+			if (hangOK && !tglReleaseMode) {
 				KernelPatcher::RouteRequest hook[] {{hangDump,wrapTGLHangRingDump,orgTGLHangRingDump}};
 				hangOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 			}
-			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLHangBatchCaptureReady",hangOK && !tglReleaseMode);
             // Exact failure-only wake call. Native STOP, wake ownership and all
             // other callers remain unchanged; no instrumentation in normal submits.
             if((XELP::kernelOS(version)==XELP::OS::Tahoe)) {
              const uint8_t before[] {0x41,0x89,0xf6,0x49,0x89,0xff,0x48,0x8b,0x7f,0x10,0xbe,1,0,0,0,0xba,7,0,0,0,0xe8,0x8e,0x22,0xfd,0xff};
              const uint8_t stop[] {0x42,0xc7,0x04,0x20,1,0,1,0};
-             bool ok=hangOK && size>0x569c6 &&
+             bool ok=!tglReleaseMode && hangOK && size>0x569c6 &&
               patcher.solveSymbol<mach_vm_address_t>(index,"__ZN11IGScheduler19haltCommandStreamerE10IGHwCsType",address,size)==address+0x56978 &&
               !memcmp(reinterpret_cast<void *>(address+0x56983),before,sizeof(before)) &&
               !memcmp(reinterpret_cast<void *>(address+0x569be),stop,sizeof(stop));
@@ -12027,7 +12035,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
             const bool smpRequested=ADLSRCSFlush::requested(xeProfile,XELP::kernelOS(version),
              checkKernelArgument("-disablegfxfirmware"),localABI && localABI->isTrue(),
              checkKernelArgument("-wex-adls-smp-trace"));
-            bool smpReady=smpRequested && tglAcceleratorReady && tglHangPreStopReady;
+            bool smpReady=!tglReleaseMode && smpRequested && tglAcceleratorReady && tglHangPreStopReady;
             if(smpReady) {
              auto live=OSSerializer::forTarget(nullptr,tglConcurrencySerialize);
              smpReady=live && IORegistryEntry::getRegistryRoot()->setProperty("TGLSMPTraceLive",live);
@@ -14021,7 +14029,7 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
  }
 
 	tglTimeEvent(22, 0, false, 0, 0);
-	SYSLOG("igfx", "TGL framebuffer start entered");
+	DBGLOG("igfx", "TGL framebuffer start entered");
 	bool result = FunctionCast(wrapTGLFramebufferStart, callbackXE->orgFramebufferStart)(that, provider);
 	tglTimeEvent(22, 0, true, 0, result);
  tglRecordStartOrder(4,that,9,0,0,result);
@@ -14053,7 +14061,7 @@ bool XE::wrapTGLFramebufferStart(IOService *that, IOService *provider) {
  if(result) if(auto power=OSSerializer::forTarget(that,tglPowerSerialize)) {
   that->setProperty("TGLPowerSample",power);power->release();
  }
-	SYSLOG("igfx", "TGL framebuffer start returned %d", result);
+	DBGLOG("igfx", "TGL framebuffer start returned %d", result);
 	return result;
 }
 
@@ -14175,7 +14183,7 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
   }
 	}
 	tglObserveAccelerator(that, 2, false, 0, reinterpret_cast<uintptr_t>(provider));
-	SYSLOG("igfx", "TGL accelerator start entered");
+	DBGLOG("igfx", "TGL accelerator start entered");
 	bool result = FunctionCast(wrapTGLAcceleratorStart, callbackXE->orgTGLAcceleratorStart)(that, provider);
 	if (result) IORegistryEntry::getRegistryRoot()->setProperty("TGLIOSurfaceCCSAtStart",
 		*reinterpret_cast<uint8_t *>(reinterpret_cast<uint8_t *>(that)+0x1474),32);
@@ -14190,7 +14198,7 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
  tglHost.startingOwner=nullptr;
 	tglObserveAccelerator(that, 2, true, result, reinterpret_cast<uintptr_t>(provider));
 	tglRecordStartOrder(6,that,9,0,0,result);
-	SYSLOG("igfx", "TGL accelerator start returned %d", result);
+	DBGLOG("igfx", "TGL accelerator start returned %d", result);
 	if(result && callbackXE->adlnDetected && checkKernelArgument("-wex-adln-kernel-ctx"))adlnRunKernelContextTrial(that);
 	return result;
 }
@@ -15347,7 +15355,7 @@ void tglCaptureHangDetail(const TGLHangPending::Capture &pending,const uint8_t *
 }
 
 static void tglSubmitHistoryRecord(void *owner,void *streamer,uint32_t ordinal,unsigned phase) {
- if(!tglSameTailEnabled || !tglHangPreStopReady || tglSubmitHistory.stopped() ||
+ if(tglReleaseMode || !tglSameTailEnabled || !tglHangPreStopReady || tglSubmitHistory.stopped() ||
     !tglVM.nofault || owner!=tglHost.owner || streamer!=tglCSBEngines[0].streamer)return;
  auto base=tglHostBase();if(!base)return;
  TGLSubmitHistory::Record r{};r.q[0]=1;tglHostClock(r.q+1);
@@ -15772,6 +15780,7 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
  auto x=static_cast<uint8_t *>(streamer); uint32_t n=arrsize(tglHost.submit);
  if (tglHost.owner && *reinterpret_cast<void **>(x+0x10)==tglHost.owner)
   n=__sync_fetch_and_add(&tglHost.submits,1);
+ if(tglReleaseMode)n=arrsize(tglHost.submit);
  if (renderWakeOwner) {
   if (n<arrsize(tglHost.submit)) {
    auto q=tglHost.submit[n].q;q[47]=97;
@@ -15815,7 +15824,7 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
       tglVMRead(sp+0x30+(1-bank)*16,item) && item)tglVMRead(item,context);
    tglRPCSPowerObserve(renderWakeOwner,context,n,0);
   }
-  if (cpsOrdinal<=8 || !(cpsOrdinal&255)) if (auto b=tglHostBase()) {
+  if (!tglReleaseMode && (cpsOrdinal<=8 || !(cpsOrdinal&255))) if (auto b=tglHostBase()) {
    const auto mcrBefore=*reinterpret_cast<volatile uint32_t *>(b+0xFDC);
    const auto row=*reinterpret_cast<volatile uint32_t *>(b+0xE4F4);
    const auto mcrAfter=*reinterpret_cast<volatile uint32_t *>(b+0xFDC);
@@ -15957,6 +15966,7 @@ bool XE::wrapTGLHostWait(void *ring,uint32_t *stamp,uint32_t target,uint32_t tim
  auto x=static_cast<uint8_t *>(ring);uint32_t n=arrsize(tglHost.wait);
  if (tglHost.owner && *reinterpret_cast<void **>(x+0x10)==tglHost.owner &&
   (tglHost.startupDone || tglHost.startThread==reinterpret_cast<uintptr_t>(current_thread()))) n=__sync_fetch_and_add(&tglHost.waits,1);
+ if(tglReleaseMode)n=arrsize(tglHost.wait);
  if (n<arrsize(tglHost.wait)) {
   auto &r=tglHost.wait[n];auto q=r.q;tglHostClock(q);
   q[1]=reinterpret_cast<uintptr_t>(ring);q[2]=x[0x40];q[3]=target;q[4]=timeout;
@@ -16339,7 +16349,7 @@ uint32_t XE::wrapTGLProbePort(void *port) {
 	IORegistryEntry::getRegistryRoot()->setProperty(modeKey, mode, 32);
 	IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGLastProbedDDI", ddi, 32);
 	IORegistryEntry::getRegistryRoot()->setProperty("TGLWEGLastProbedMode", mode, 32);
-	SYSLOG("igfx", "TGL port probe ddi=%u mode=%u", ddi, mode);
+	DBGLOG("igfx", "TGL port probe ddi=%u mode=%u", ddi, mode);
 	tglConnectionRecord(port, 0, true, mode, 0, caller);
 	return mode;
 }
@@ -16418,7 +16428,7 @@ bool XE::wrapTGLHDCP2Init(void *hdcp, void *path) {
 	char key[48];
 	snprintf(key, sizeof(key), "TGLWEGHDCP2FB%uManager", index);
 	IORegistryEntry::getRegistryRoot()->setProperty(key, evidence, sizeof(evidence));
-	SYSLOG("igfx", "TGL HDCP2 init fb=%u missing=%d bound=%d", index, missing, stored == manager);
+	DBGLOG("igfx", "TGL HDCP2 init fb=%u missing=%d bound=%d", index, missing, stored == manager);
 	return stored == manager;
 }
 
@@ -17728,7 +17738,7 @@ void XE::tglObserveTrainingLease(const TGLTrainingLease &lease, uint32_t event, 
 }
 
 uint32_t XE::tglPrepareTrainingLease(void *controller, TGLTrainingLease &lease) {
-	SYSLOG("igfx", "TGL330 prepare enter ddi=%u", lease.ddi);
+	DBGLOG("igfx", "TGL330 prepare enter ddi=%u", lease.ddi);
 	auto s = callbackXE;
 	auto ctl = static_cast<uint8_t *>(controller);
 	auto port = static_cast<uint8_t *>(reinterpret_cast<void *(*)(uint32_t)>(s->tglPortByDDI)(lease.ddi));
@@ -17797,14 +17807,14 @@ uint32_t XE::tglPrepareTrainingLease(void *controller, TGLTrainingLease &lease) 
 	IORecursiveLockUnlock(s->tglPathPoolLock);
 	// Keep the selected domain powered while checking, training and restoring
 	// its registers. No pool lock is held across native power waits.
-	SYSLOG("igfx", "TGL330 prepare power-enter ddi=%u pipe=%u pg=%u", lease.ddi, pipe, lease.pg);
+	DBGLOG("igfx", "TGL330 prepare power-enter ddi=%u pipe=%u pg=%u", lease.ddi, pipe, lease.pg);
 	if(s->trainingLeasePower) {
         if(!s->trainingLeasePower(power,lease.pg,true)) {
             IORecursiveLockLock(s->tglPathPoolLock);lease.busy=false;IORecursiveLockUnlock(s->tglPathPoolLock);
             return 8; // Keep the native reservation on an unproven power transition.
         }
     } else reinterpret_cast<void (*)(void *, uint32_t)>(s->tglEnablePG)(power, lease.pg);
-	SYSLOG("igfx", "TGL330 prepare power-return ddi=%u", lease.ddi);
+	DBGLOG("igfx", "TGL330 prepare power-return ddi=%u", lease.ddi);
 	lease.powerOwned = true;
     if(s->trainingLeaseValidate && !s->trainingLeaseValidate(controller,port,pipe)) {
         IORecursiveLockLock(s->tglPathPoolLock);lease.busy=false;IORecursiveLockUnlock(s->tglPathPoolLock);return 8;
@@ -17840,7 +17850,7 @@ uint32_t XE::tglPrepareTrainingLease(void *controller, TGLTrainingLease &lease) 
 		static_cast<OSObject *>(power)->release();
 		return 5;
 	}
-	SYSLOG("igfx", "TGL330 prepare registers-valid ddi=%u", lease.ddi);
+	DBGLOG("igfx", "TGL330 prepare registers-valid ddi=%u", lease.ddi);
 	lease.savedClock = clock; lease.savedFunc = func; lease.savedTP = tp;lease.prepared=true;
 	tglObserveTrainingLease(lease, 0, 0);
 	tglObserveTrainingLease(lease, 1, 0);
@@ -17848,7 +17858,7 @@ uint32_t XE::tglPrepareTrainingLease(void *controller, TGLTrainingLease &lease) 
 }
 
 bool XE::tglReleaseTrainingLease(TGLTrainingLease &lease, bool disableLink) {
-	SYSLOG("igfx", "TGL330 release enter ddi=%u disable=%u", lease.ddi, disableLink);
+	DBGLOG("igfx", "TGL330 release enter ddi=%u disable=%u", lease.ddi, disableLink);
 	auto s = callbackXE;
  // A failed extra-reference put after adoption is not a training reservation.
  // Native scanout owns (and may already have freed) the path. Retry only our
@@ -17931,7 +17941,7 @@ bool XE::tglReleaseTrainingLease(TGLTrainingLease &lease, bool disableLink) {
 	lease.adoptThread = nullptr; lease.adopted = false; lease.endCleanupPending = false;
 	IORecursiveLockUnlock(s->tglPathPoolLock);
 	static_cast<OSObject *>(static_cast<void *>(fb))->release(); port->release(); power->release();
-	SYSLOG("igfx", "TGL330 release return ddi=%u", lease.ddi);
+	DBGLOG("igfx", "TGL330 release return ddi=%u", lease.ddi);
 	return true;
 }
 
@@ -18040,9 +18050,9 @@ uint32_t XE::wrapTGLTrainingBegin(void *controller, void *request) {
 	}
 	uint32_t a = 0, b = 0;
 	tglTrace(18, id, false, a, b, 0, 0);
-	SYSLOG("igfx", "TGL330 Begin native-enter id=%u", id);
+	DBGLOG("igfx", "TGL330 Begin native-enter id=%u", id);
 	const auto r = FunctionCast(wrapTGLTrainingBegin, callbackXE->orgTGLTrainingBegin)(controller, request);
-	SYSLOG("igfx", "TGL330 Begin native-return id=%u result=%x", id, r);
+	DBGLOG("igfx", "TGL330 Begin native-return id=%u result=%x", id, r);
 	if (selected) {
 		IORecursiveLockLock(s->tglPathPoolLock); selected->busy = false; IORecursiveLockUnlock(s->tglPathPoolLock);
 	}
@@ -18071,7 +18081,7 @@ uint32_t XE::wrapTGLTraining(void *controller, void *request, void *output) {
 	if (id == 5) tglObserveActivation(controller, nullptr, nullptr, 0, false, 0);
 	auto selected = id ? tglTrainingLeaseForDDI(id - 1) : nullptr;
 	const uint32_t leaseError = selected ? tglPrepareTrainingLease(controller, *selected) : 0;
-	SYSLOG("igfx", "TGL330 prepare returned id=%u result=%u", id, leaseError);
+	DBGLOG("igfx", "TGL330 prepare returned id=%u result=%u", id, leaseError);
 	uint32_t r;
 	if (leaseError) {
 		tglObserveTrainingLease(*selected, 6, leaseError);
@@ -18081,10 +18091,10 @@ uint32_t XE::wrapTGLTraining(void *controller, void *request, void *output) {
 		}
 		r = kIOReturnBusy;
 	} else {
-		SYSLOG("igfx", "TGL330 training native-enter id=%u", id);
+		DBGLOG("igfx", "TGL330 training native-enter id=%u", id);
         if(selected) {IORecursiveLockLock(callbackXE->tglPathPoolLock);selected->trainingThread=current_thread();IORecursiveLockUnlock(callbackXE->tglPathPoolLock);}
 		r = FunctionCast(wrapTGLTraining, callbackXE->orgTGLTraining)(controller, request, output);
-		SYSLOG("igfx", "TGL330 training native-return id=%u result=%x", id, r);
+		DBGLOG("igfx", "TGL330 training native-return id=%u result=%x", id, r);
 	}
 	if (selected && !leaseError) {
 		auto &lease = *selected;
@@ -18146,9 +18156,9 @@ uint32_t XE::wrapTGLTrainingEnd(void *controller, void *request) {
 	const bool retryCleanup = leased && selected->endCleanupPending;
 	uint32_t r = 0;
 	if (!retryCleanup) {
-		SYSLOG("igfx", "TGL330 End native-enter id=%u", id);
+		DBGLOG("igfx", "TGL330 End native-enter id=%u", id);
 		r = FunctionCast(wrapTGLTrainingEnd, callbackXE->orgTGLTrainingEnd)(controller, request);
-		SYSLOG("igfx", "TGL330 End native-return id=%u result=%x", id, r);
+		DBGLOG("igfx", "TGL330 End native-return id=%u result=%x", id, r);
 	}
 	if (leased) {
 		auto &lease = *selected;
@@ -18369,7 +18379,7 @@ bool XE::wrapTGLAllocatePathResources(void *fb, uint32_t portIndex, uint32_t str
  if(!display13RetirementHealthy())return false;
  FramebufferDonor::Call admission(callbackXE->framebufferProtocolCalls);
  if(!admission){return false;}
-	SYSLOG("igfx", "TGL330 resources enter ddi=%u stream=%u", portIndex, stream);
+	DBGLOG("igfx", "TGL330 resources enter ddi=%u stream=%u", portIndex, stream);
 	auto caller = __builtin_return_address(0);
 	tglObserveResource(fb, nullptr, 9, false, 0, portIndex, stream, caller);
 	auto s = callbackXE;
@@ -18397,9 +18407,9 @@ bool XE::wrapTGLAllocatePathResources(void *fb, uint32_t portIndex, uint32_t str
 		s->tglAllocatingFB[portIndex] = fb; claimed = true;
 		IORecursiveLockUnlock(s->tglPathPoolLock);
 	}
-	SYSLOG("igfx", "TGL330 resources native-enter ddi=%u adopt=%u", portIndex, adopting);
+	DBGLOG("igfx", "TGL330 resources native-enter ddi=%u adopt=%u", portIndex, adopting);
 	const auto r = FunctionCast(wrapTGLAllocatePathResources, callbackXE->orgTGLAllocatePathResources)(fb, portIndex, stream);
-	SYSLOG("igfx", "TGL330 resources native-return ddi=%u result=%u", portIndex, r);
+	DBGLOG("igfx", "TGL330 resources native-return ddi=%u result=%u", portIndex, r);
 	if (adopting) {
 		tglObserveTrainingLease(*selected, 7, r ? 0 : 2);
 		if (selected->adopted) {
@@ -18523,14 +18533,14 @@ uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
 		}
 	}
  tglAUXRecord(port,10,false,0,0,0);
-	SYSLOG("igfx", "TGL330 port-training enter");
+	DBGLOG("igfx", "TGL330 port-training enter");
 	auto caller = __builtin_return_address(0);
 	tglObservePath(port, nullptr, 0, false, 0, request != nullptr, caller);
 	const auto token = tglTrainingScopes.enter(reinterpret_cast<uintptr_t>(current_thread()));
 	const auto r = FunctionCast(wrapTGLPortTraining, callbackXE->orgTGLPortTraining)(port, request);
 	tglTrainingScopes.leave(token);
  tglAUXRecord(port,10,true,r,0,0);
-	SYSLOG("igfx", "TGL330 port-training return result=%x", r);
+	DBGLOG("igfx", "TGL330 port-training return result=%x", r);
 	static uint32_t count {};
 	IORegistryEntry::getRegistryRoot()->setProperty("TGLQuietTrainingCalls",
 		__sync_add_and_fetch(&count, 1), 32);
@@ -18887,7 +18897,7 @@ void XE::wrapTGLEnableCombo(void *port) {
 	}
 	char key[48]; snprintf(key, sizeof(key), "TGLCombo%uEntry", static_cast<uint32_t>(r[2]));
 	IORegistryEntry::getRegistryRoot()->setProperty(key, r, sizeof(r));
-	SYSLOG("igfx", "TGL combo ddi=%u absent=%u comp3=%x", static_cast<uint32_t>(r[2]), absent, static_cast<uint32_t>(r[12]));
+	DBGLOG("igfx", "TGL combo ddi=%u absent=%u comp3=%x", static_cast<uint32_t>(r[2]), absent, static_cast<uint32_t>(r[12]));
 	if (!absent) FunctionCast(wrapTGLEnableCombo, callbackXE->orgTGLEnableCombo)(port);
 }
 
